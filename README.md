@@ -37,6 +37,13 @@
 
 本計畫旨在透過資料處理、特徵分析和模型訓練，建構一個高效的車禍類型分類模型，並使用SHAP分析每年車禍結果的分類變化。以下是具體的執行步驟。
 
+## 環境需求
+ -  Python 3.8+
+ -  pandas, numpy
+ -  scikit-learn
+ -  shap
+ -  openpyxl
+
 ### 步驟1：資料處理
 
 #### `python data.py`
@@ -162,7 +169,9 @@
     - 對所有非數值型特徵進行one-hot編碼，準備進行機器學習模型訓練。
 
 ### 步驟3：模型測試
-
+#### 模型結構
+    - 採用 RandomForestClassifier 為主要分類模型。
+    - 比較 DecisionTree, XGBoost, GradientBoosting 模型表現。
 #### 操作
 1. **模型選擇**
     - 選擇合適的分類模型（如決策樹、隨機森林、梯度提升）。
