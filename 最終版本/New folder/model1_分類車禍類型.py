@@ -1,232 +1,211 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
+import random
 
-# 超参数配置区块
+# =====================================================
+# 固定隨機種子，確保可重現性
+# =====================================================
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+
+# =====================================================
+# 配置參數區塊
+# =====================================================
 class Config:
-    input_size = 50  # 输入层大小
-    num_classes = 67  # 输出类别数
-    hidden_sizes = [512, 256, 128]  # 隐藏层大小
-    learning_rate = 0.001  # 学习率
-    momentum = 0.9  # 动量
-    num_epochs = 15  # 迭代次数
-    batch_size = 100  # 批量大小
-    dropout_prob = 0.5  # Dropout 概率
+    DATA_PATH = 'step1.csv'
+    TEST_YEAR = 2020
+    HIDDEN_SIZES = [512, 256]
+    DROPOUT_PROB = 0.3
+    LEARNING_RATE = 1e-3
+    BATCH_SIZE = 64
+    NUM_EPOCHS = 30
+    LR_STEP_SIZE = 5
+    LR_GAMMA = 0.5
+    EARLY_STOPPING_PATIENCE = 8
 
-# 读取CSV文件
-file_path = 'step1.csv'
-new_df = pd.read_csv(file_path)
-print('Data load -> OK')
+# =====================================================
+# 資料處理：回傳 DataLoader、測試集與標籤名稱
+# =====================================================
+def load_data(path):
+    df = pd.read_csv(path, low_memory=False)
+    train_df = df[df['year'] != Config.TEST_YEAR].copy()
+    test_df  = df[df['year'] == Config.TEST_YEAR].copy()
 
-# 数据预处理
-# 将2020年的数据分离出来
-test_df = new_df[new_df['year'] == 2020]
-train_df = new_df[new_df['year'] != 2020]
+    y_train = train_df['cause_code_individual']
+    y_test  = test_df['cause_code_individual']
+    X_train = train_df.drop(columns=['cause_code_individual','year'])
+    X_test  = test_df.drop(columns=['cause_code_individual','year'])
 
-# 将 DataFrame 转换为 numpy 数组
-X_train = train_df.drop(columns=['cause_code_individual', 'year']).values
-y_train = train_df['cause_code_individual'].values
-X_test = test_df.drop(columns=['cause_code_individual', 'year']).values
-y_test = test_df['cause_code_individual'].values
+    # One-Hot 編碼
+    cat_cols = X_train.select_dtypes(include=['object']).columns
+    X_train = pd.get_dummies(X_train, columns=cat_cols)
+    X_test  = pd.get_dummies(X_test,  columns=cat_cols)
+    X_train, X_test = X_train.align(X_test, join='left', axis=1, fill_value=0)
 
-# 处理标签
-label_encoder = LabelEncoder()
-y_train = label_encoder.fit_transform(y_train)
-y_test = label_encoder.transform(y_test)
+    # 標準化
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test  = scaler.transform(X_test)
 
-# 将数据标准化
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+    # 標籤編碼並保留名稱
+    encoder = LabelEncoder()
+    y_train = encoder.fit_transform(y_train)
+    y_test  = encoder.transform(y_test)
+    class_names = encoder.classes_
 
-# 转换为 Tensor
-X_train = torch.tensor(X_train, dtype=torch.float32)
-X_test = torch.tensor(X_test, dtype=torch.float32)
-y_train = torch.tensor(y_train, dtype=torch.long)
-y_test = torch.tensor(y_test, dtype=torch.long)
+    # 轉為 Tensor 並移到設備
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+    X_test  = torch.tensor(X_test,  dtype=torch.float32).to(device)
+    y_train = torch.tensor(y_train, dtype=torch.long).to(device)
+    y_test  = torch.tensor(y_test, dtype=torch.long).to(device)
 
-# 检查是否有GPU可用
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Using device: {device}')
+    train_loader = DataLoader(TensorDataset(X_train,y_train), batch_size=Config.BATCH_SIZE, shuffle=True)
+    test_loader  = DataLoader(TensorDataset(X_test ,y_test ), batch_size=Config.BATCH_SIZE, shuffle=False)
+    return train_loader, test_loader, X_test, y_test, class_names
 
-# 将数据移动到GPU
-X_train = X_train.to(device)
-X_test = X_test.to(device)
-y_train = y_train.to(device)
-y_test = y_test.to(device)
-
-# 创建 DataLoader
-train_dataset = TensorDataset(X_train, y_train)
-test_dataset = TensorDataset(X_test, y_test)
-train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=Config.batch_size, shuffle=False)
-
-# 定义全连接神经网络模型
+# =====================================================
+# 模型定義
+# =====================================================
 class FCNNModel(nn.Module):
-    def __init__(self, input_size, num_classes, hidden_sizes):
-        super(FCNNModel, self).__init__()
-        self.layers = nn.ModuleList()
-        for in_features, out_features in zip([input_size] + hidden_sizes, hidden_sizes):
-            self.layers.append(nn.Linear(in_features, out_features))
-            self.layers.append(nn.ReLU())
-        self.layers.append(nn.Linear(hidden_sizes[-1], num_classes))
-        self.dropout = nn.Dropout(Config.dropout_prob)
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for h in Config.HIDDEN_SIZES:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(Config.DROPOUT_PROB))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
+        return self.net(x)
 
-model = FCNNModel(Config.input_size, Config.num_classes, Config.hidden_sizes).to(device)
+# =====================================================
+# 訓練與驗證函式
+# =====================================================
+def train_and_validate(model, train_loader, val_loader):
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=Config.LR_STEP_SIZE, gamma=Config.LR_GAMMA)
+    criterion = nn.CrossEntropyLoss()
 
-# 定义优化器和损失函数
-optimizer = optim.Adam(model.parameters(), lr=Config.learning_rate)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-criterion = nn.CrossEntropyLoss()
+    best_val_loss = float('inf')
+    no_improve = 0
+    history = {'train_loss':[], 'val_loss':[], 'train_acc':[], 'val_acc':[]}
 
-# 训练模型
-train_losses, val_losses = [], []
-train_accuracies, val_accuracies = [], []
+    for epoch in range(1, Config.NUM_EPOCHS+1):
+        model.train()
+        running_loss, preds, labels = 0.0, [], []
+        for Xb, yb in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
+            optimizer.zero_grad()
+            out = model(Xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * Xb.size(0)
+            preds.append(out.argmax(dim=1).cpu())
+            labels.append(yb.cpu())
+        train_loss = running_loss / len(train_loader.dataset)
+        train_acc  = accuracy_score(torch.cat(labels), torch.cat(preds))
 
-for epoch in range(Config.num_epochs):
-    model.train()
-    running_loss, correct, total = 0.0, 0, 0
-    
-    # 创建一个进度条
-    train_progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.num_epochs}, Training")
-    
-    for inputs, labels in train_progress_bar:
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * inputs.size(0)
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        train_progress_bar.set_postfix(train_loss=running_loss / total, train_accuracy=correct / total)
-    
-    train_loss = running_loss / len(train_loader.dataset)
-    train_accuracy = correct / total
-    train_losses.append(train_loss)
-    train_accuracies.append(train_accuracy)
+        model.eval()
+        val_loss, vpreds, vlabels = 0.0, [], []
+        with torch.no_grad():
+            for Xb, yb in tqdm(val_loader, desc=f"Epoch {epoch} Validation"):
+                out = model(Xb)
+                l = criterion(out, yb)
+                val_loss += l.item() * Xb.size(0)
+                vpreds.append(out.argmax(dim=1).cpu())
+                vlabels.append(yb.cpu())
+        val_loss = val_loss / len(val_loader.dataset)
+        val_acc  = accuracy_score(torch.cat(vlabels), torch.cat(vpreds))
 
-    model.eval()
-    val_loss, correct, total = 0.0, 0, 0
-    
-    # 创建一个进度条
-    val_progress_bar = tqdm(test_loader, desc=f"Epoch {epoch+1}/{Config.num_epochs}, Validation")
-    
-    with torch.no_grad():
-        for inputs, labels in val_progress_bar:
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            val_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            val_progress_bar.set_postfix(val_loss=val_loss / total, val_accuracy=correct / total)
-    
-    val_loss /= len(test_loader.dataset)
-    val_accuracy = correct / total
-    val_losses.append(val_loss)
-    val_accuracies.append(val_accuracy)
-    scheduler.step()
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
 
-# 绘制训练和验证的损失以及准确性图表
-plt.figure(figsize=(12, 4))
+        print(f"Epoch {epoch:02d}: Train Loss={train_loss:.4f}, Acc={train_acc:.4f} | Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}")
 
-# 绘制损失图表
-plt.subplot(1, 2, 1)
-plt.plot(train_losses, label='Training Loss')
-plt.plot(val_losses, label='Validation Loss')
-plt.title('Training and Validation Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            no_improve += 1
+            if no_improve >= Config.EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
+                break
+        scheduler.step()
 
-# 绘制准确性图表
-plt.subplot(1, 2, 2)
-plt.plot(train_accuracies, label='Training Accuracy')
-plt.plot(val_accuracies, label='Validation Accuracy')
-plt.title('Training and Validation Accuracy')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
+    model.load_state_dict(torch.load('best_model.pth'))
+    return history
 
-plt.show()
-
-# 训练和验证完成后，评估模型在测试集上的性能
-model.eval()  # 设置模型为评估模式
-test_loss, correct, total = 0.0, 0, 0
-
-predicted_labels = []
-true_labels = []
-
-with torch.no_grad():
-    for inputs, labels in test_loader:
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        test_loss += loss.item() * inputs.size(0)
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        predicted_labels.extend(predicted.cpu().numpy())
-        true_labels.extend(labels.cpu().numpy())
-
-test_loss /= len(test_loader.dataset)
-test_accuracy = correct / total
-
-print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}')
-
-# 打印混淆矩阵
-conf_matrix = confusion_matrix(true_labels, predicted_labels)
-
-# 可视化混淆矩阵
-plt.figure(figsize=(12, 8))
-plt.imshow(conf_matrix, cmap=plt.cm.Blues)
-plt.title('Confusion Matrix')
-plt.colorbar()
-plt.xlabel('Predicted Label')
-plt.ylabel('True Label')
-plt.xticks(np.arange(Config.num_classes), rotation=90)
-plt.yticks(np.arange(Config.num_classes))
-plt.show()
-
-# 计算特征重要性
-def permutation_importance(model, X, y, metric, n_repeats=30, random_state=42):
-    np.random.seed(random_state)
-    baseline_score = metric(model, X, y)
-    importances = np.zeros(X.shape[1])
-    
-    for col in range(X.shape[1]):
-        scores = np.zeros(n_repeats)
-        for n in range(n_repeats):
-            X_permuted = X.clone()
-            X_permuted[:, col] = X_permuted[:, col][torch.randperm(X.shape[0])]
-            scores[n] = metric(model, X_permuted, y)
-        importances[col] = baseline_score - np.mean(scores)
-    
-    return importances
-
-# 定义评估指标（如准确性）
-def accuracy_metric(model, X, y):
+# =====================================================
+# 測試與繪製混淆矩陣及歷史曲線
+# =====================================================
+def test_and_visualize(model, X_test, y_test, history, class_names):
     model.eval()
     with torch.no_grad():
-        outputs = model(X)
-        _, predicted = torch.max(outputs, 1)
-        return (predicted == y).float().mean().item()
+        out = model(X_test)
+    preds = out.argmax(dim=1).cpu().numpy()
+    trues = y_test.cpu().numpy()
 
-# 计算特征重要性
-importances = permutation_importance(model, X_test, y_test, accuracy_metric)
+    # 輸出 Test Loss & Accuracy
+    loss_val = nn.CrossEntropyLoss()(out, y_test).item()
+    acc = accuracy_score(trues, preds)
+    print(f"Test Loss:     {loss_val:.4f}")
+    print(f"Test Accuracy: {acc:.4f}")
 
-# 打印
+    # 混淆矩陣
+    cm = confusion_matrix(trues, preds)
+    plt.figure(figsize=(8,6))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.xticks(np.arange(len(class_names)), class_names, rotation=90)
+    plt.yticks(np.arange(len(class_names)), class_names)
+    plt.tight_layout()
+    plt.show()
+
+    # 訓練/驗證 Loss & Accuracy曲線
+    fig, axes = plt.subplots(1,2,figsize=(12,4))
+    axes[0].plot(history['train_loss'], label='Train Loss')
+    axes[0].plot(history['val_loss'],   label='Val Loss')
+    axes[0].set_title('Loss Curve')
+    axes[0].legend()
+
+    axes[1].plot(history['train_acc'], label='Train Acc')
+    axes[1].plot(history['val_acc'],   label='Val Acc')
+    axes[1].set_title('Accuracy Curve')
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# =====================================================
+# 主程式
+# =====================================================
+def main():
+    train_loader, test_loader, X_test, y_test, classes = load_data(Config.DATA_PATH)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = FCNNModel(input_dim=X_test.shape[1], num_classes=len(classes)).to(device)
+    history = train_and_validate(model, train_loader, test_loader)
+    test_and_visualize(model, X_test, y_test, history, classes)
+
+if __name__ == '__main__':
+    main()
