@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 读取step3.csv文件
-df = pd.read_csv('model2.csv')
+df = pd.read_csv('d:\DL\DL2025_Team5_Cause_detection_for_increase_in_traffic_accidents-main\DL2025_Team5_Cause_detection_for_increase_in_traffic_accidents-main\dataset\model2.csv')
 
 # 設置日期範圍
 test_start_date = '2020-01-01'
